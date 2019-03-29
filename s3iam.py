@@ -30,6 +30,11 @@ import yum.plugins
 
 from yum.yumRepo import YumRepository
 
+# Fix for the issue ssl.CertificateError: hostname 'x' doesn't match either of '*.s3.amazonaws.com', 's3.amazonaws.com'
+import ssl
+if hasattr(ssl, '_create_unverified_context'):
+    ssl._create_default_https_context = ssl._create_unverified_context
+
 __author__ = "Julius Seporaitis"
 __email__ = "julius@seporaitis.net"
 __copyright__ = "Copyright 2012, Julius Seporaitis"
@@ -46,7 +51,7 @@ CONDUIT = None
 DEFAULT_DELAY = 3
 DEFAULT_BACKOFF = 2
 BUFFER_SIZE = 1024 * 1024
-OPTIONAL_ATTRIBUTES = ['priority', 'base_persistdir', 'metadata_expire',
+OPTIONAL_ATTRIBUTES = ['base_persistdir', 'metadata_expire',
                        'skip_if_unavailable', 'keepcache', 'priority']
 UNSUPPORTED_ATTRIBUTES = ['mirrorlist']
 
@@ -56,6 +61,7 @@ def config_hook(conduit):
     yum.config.RepoConf.region = yum.config.Option()
     yum.config.RepoConf.key_id = yum.config.Option()
     yum.config.RepoConf.secret_key = yum.config.Option()
+    yum.config.RepoConf.token = yum.config.Option()
     yum.config.RepoConf.delegated_role = yum.config.Option()
     yum.config.RepoConf.baseurl = yum.config.UrlListOption(
         schemes=('http', 'https', 's3', 'ftp', 'file')
@@ -144,8 +150,9 @@ class S3Repository(YumRepository):
         self.basecachedir = repo.basecachedir
         self.gpgcheck = repo.gpgcheck
         self.gpgkey = repo.gpgkey
-        self.access_id = repo.key_id
+        self.key_id = repo.key_id
         self.secret_key = repo.secret_key
+        self.token = repo.token
         self.enablegroups = repo.enablegroups
         self.delegated_role = repo.delegated_role
 
@@ -186,13 +193,6 @@ class S3Repository(YumRepository):
     def grab(self):
         if not self.grabber:
             self.grabber = S3Grabber(self)
-            if self.access_id and self.secret_key:
-                self.grabber.set_credentials(self.access_id, self.secret_key)
-            elif self.delegated_role:
-                self.grabber.get_delegated_role_credentials(self.delegated_role)
-            else:
-                self.grabber.get_role()
-                self.grabber.get_credentials()
         return self.grabber
 
 
@@ -225,6 +225,9 @@ class S3Grabber(object):
         self.access_key = None
         self.secret_key = None
         self.token = None
+        self.repo = repo
+        self.credentials_set = False
+        self.setup_credentials()
 
     def get_role(self):
         """Read IAM role from AWS metadata store."""
@@ -237,18 +240,59 @@ class S3Grabber(object):
         try:
             response = urllib2.urlopen(request)
             self.iamrole = (response.read())
+            response.close()
         except Exception:
-            response = None
             self.iamrole = ""
-        finally:
-            if response:
-                response.close()
 
-    def get_credentials(self):
+    def setup_credentials(self):
+        """
+        Attempts to setup credentials in the following strict priority order, from explicit to implicit,
+        1. Access key, secret and token set in repository configuration
+        2. Environment variables
+        3. IAM role(3rd party cross-account), if set in the repo configuration(delegated_role=<rolearn>)
+        4. Instance profile IAM role
+        """
+        repo = self.repo
+        if repo.key_id and repo.secret_key and repo.token:
+            self.set_credentials(repo.key_id, repo.secret_key, repo.token)
+        elif repo.key_id and repo.secret_key:
+            self.set_credentials(repo.key_id, repo.secret_key)
+        else:
+            self.setup_environment_credentials()
+            if not self.credentials_set:
+                if repo.delegated_role:
+                    self.setup_delegated_role_credentials(repo.delegated_role)
+                else:
+                    self.setup_instance_profile_role_credentials()
+        if not self.credentials_set:
+            if hasattr(repo, 'name'):
+                msg = "Could not access AWS credentials, skipping repository '%s'" % (repo.name)
+            else:
+                msg = "Could not access AWS credentials"
+            print msg
+            from urlgrabber.grabber import URLGrabError
+            raise URLGrabError(7, msg)
+
+    def setup_environment_credentials(self):
+        if "AWS_ACCESS_KEY_ID" in os.environ and \
+           "AWS_SECRET_ACCESS_KEY" in os.environ and \
+           "AWS_SESSION_TOKEN" in os.environ:
+            self.set_credentials(os.environ['AWS_ACCESS_KEY_ID'],
+                                 os.environ['AWS_SECRET_ACCESS_KEY'],
+                                 os.environ['AWS_SESSION_TOKEN'])
+        elif "AWS_ACCESS_KEY_ID" in os.environ and \
+             "AWS_SECRET_ACCESS_KEY" in os.environ:
+              self.set_credentials(os.environ['AWS_ACCESS_KEY_ID'],
+                                 os.environ['AWS_SECRET_ACCESS_KEY'])
+
+
+    def setup_instance_profile_role_credentials(self):
         """Read IAM credentials from AWS metadata store.
         Note: This method should be explicitly called after constructing new
               object, as in 'explicit is better than implicit'.
         """
+        self.get_role()
+
         request = urllib2.Request(
             urlparse.urljoin(
                 urlparse.urljoin(
@@ -259,38 +303,17 @@ class S3Grabber(object):
         try:
             response = urllib2.urlopen(request)
             data = json.loads(response.read())
-            self.access_key = data['AccessKeyId']
-            self.secret_key = data['SecretAccessKey']
-            self.token = data['Token']
+            self.set_credentials(data['AccessKeyId'], data['SecretAccessKey'], data['Token'])
         except Exception:
-            response = None
-        finally:
-            if response:
-                response.close()
+            None
 
-        if self.access_key is None and self.secret_key is None:
-            if "AWS_ACCESS_KEY_ID" in os.environ:
-                self.access_key = os.environ['AWS_ACCESS_KEY_ID']
-            if "AWS_SECRET_ACCESS_KEY" in os.environ:
-                self.secret_key = os.environ['AWS_SECRET_ACCESS_KEY']
-            if "AWS_SESSION_TOKEN" in os.environ:
-                self.token = os.environ['AWS_SESSION_TOKEN']
-
-        if self.access_key is None and self.secret_key is None:
-            if hasattr(self, 'name'):
-                msg = "Could not access AWS credentials, skipping repository '%s'" % (self.name)
-            else:
-                msg = "Could not access AWS credentials"
-            print msg
-            from urlgrabber.grabber import URLGrabError
-            raise URLGrabError(7, msg)
-
-    def set_credentials(self, access_key, secret_key):
+    def set_credentials(self, access_key, secret_key, token=None):
         self.access_key = access_key
         self.secret_key = secret_key
-        self.token = None
+        self.token = token
+        self.credentials_set = True
 
-    def get_delegated_role_credentials(self, delegated_role):
+    def setup_delegated_role_credentials(self, delegated_role):
         """Collect temporary credentials from AWS STS service. Uses
         delegated_role value from configuration.
         Note: This method should be explicitly called after constructing new
@@ -301,9 +324,9 @@ class S3Grabber(object):
         sts_conn = boto.sts.connect_to_region(self.get_instance_region())
         assumed_role = sts_conn.assume_role(delegated_role, 'yum')
 
-        self.access_key = assumed_role.credentials.access_key
-        self.secret_key = assumed_role.credentials.secret_key
-        self.token = assumed_role.credentials.session_token
+        self.set_credentials(assumed_role.credentials.access_key,
+                             assumed_role.credentials.secret_key,
+                             assumed_role.credentials.session_token)
 
     def get_instance_region(self):
         """Read region from AWS metadata store."""
