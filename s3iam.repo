@@ -22,5 +22,10 @@ failovermethod=priority
 enabled=1
 s3_enabled=1
 gpgcheck=0
+; provide AWS secret credentials, token is optional(in case credentials from 3rd party access role is used)
+; key_id=<access key id>
+; secret_key=<secret key>
+; token=<session token>
 ; provide a delegated role arn to support a bucket in a different account
 ;delegated_role=arn:aws:iam::XXXXXXXXXXXX:role/some-role
+

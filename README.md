@@ -46,12 +46,18 @@ use the path-style URL syntax.
 Some use-cases (Continuous Integration, Docker) involve S3-hosted yum
 repositories being accessed from outside EC2. For those cases two
 options are available:
-- Use AWS API keys in AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (and
-  optionally AWS_SESSION_TOKEN) environment variables. Those will be
-  used as a fallback if IAM role credentials can not be accessed.
-- Defining the environment DISABLE_YUM_S3_IAM to 1 will disable the
-  use of the yum-s3-iam plugin. This should be used with S3 bucket IP
-  white-listing.
+- Use AWS API keys in AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (and optionally AWS_SESSION_TOKEN) environment variables.
+- Defining the environment DISABLE_YUM_S3_IAM to 1 will disable the use of the yum-s3-iam plugin. This should be used
+  with S3 bucket IP white-listing.
+
+## Credentials usage priority
+
+Credentials will be used in the strict priority:
+
+1. Access key, secret and token set in repository configuration
+2. Environment variables
+3. IAM role(3rd party cross-account), if set in the repo configuration(delegated_role=<rolearn>)
+4. Instance profile IAM role
 
 ## Limitations
 
@@ -73,12 +79,6 @@ docker-compose -f docker-compose.tests.yml down --volumes --rmi all
 ## License
 
 Apache 2.0 license. See LICENSE.
-
-## Maintainers
-
-- Mathias Brossard
-- Mischa Spiegelmock
-- Sean Edge
 
 ## Author(s)
 
